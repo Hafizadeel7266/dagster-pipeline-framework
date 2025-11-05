@@ -76,6 +76,9 @@ jobs:
           if git ls-remote --exit-code --heads origin "${TARGET_BRANCH}"; then
             git checkout "${TARGET_BRANCH}"
             git pull origin "${TARGET_BRANCH}"
+            # ensure clean working tree to avoid carrying stray deletions
+            git reset --hard "HEAD"
+            git clean -fdx
           else
             git checkout -b "${TARGET_BRANCH}"
           fi
@@ -111,17 +114,22 @@ jobs:
           echo "Status of target folder after copy:"
           ls -la "${FINAL_TARGET_PATH}" || echo "target folder missing"
 
-          # Safety check: ensure no deletions occurred outside the target folder
-          echo "Checking for unintended deletions outside '${FINAL_TARGET_PATH}'"
-          if git status --porcelain | awk '$1 ~ /^D/ {print $2}' | grep -v "^${FINAL_TARGET_PATH}/" | grep -q .; then
-            echo "ERROR: Detected deletions outside '${FINAL_TARGET_PATH}'. Aborting to protect the target repo."
-            echo "Changes detected:"
-            git status --porcelain
-            exit 1
-          fi
+          # Clear any previous staged changes (belt-and-suspenders)
+          git restore --staged :/
 
           # Stage only the target folder (do NOT stage other files)
           git add -A -- "${FINAL_TARGET_PATH}/"
+
+          # Validate index contains ONLY changes under target folder and NO deletions
+          echo "Validating staged changes are limited to '${FINAL_TARGET_PATH}/' and contain no deletions"
+          if git diff --cached --name-status | awk -v p="${FINAL_TARGET_PATH}/" '{ if ($1=="D" || index($2,p)!=1) { print; bad=1 } } END { exit bad }'; then
+            echo "Validation passed: only '${FINAL_TARGET_PATH}/' staged and no deletions."
+          else
+            echo "ERROR: Staged changes include deletions or paths outside '${FINAL_TARGET_PATH}/'. Aborting."
+            echo "Staged diff:"
+            git diff --cached --name-status
+            exit 1
+          fi
 
           # If no staged changes, exit
           if git diff --cached --quiet; then

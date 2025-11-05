@@ -1,0 +1,102 @@
+# Sync a specific folder from this repo to another repo when a tag is created.
+# - Triggers on any tag push
+# - Verifies the tag's commit is reachable from origin/main
+# - Copies SOURCE_FOLDER -> TARGET_REPO:TARGET_BRANCH at TARGET_FOLDER_PATH
+# - If TARGET_FOLDER_PATH is ".", the folder contents are copied to the target repo root
+#
+# Before using:
+# 1) Add a repository secret named TARGET_REPO_PAT (PAT with repo scope).
+# 2) Update TARGET_REPO to "Hafizadeel7266/Pinwheel_Repository" (or your destination).
+# 3) Confirm TARGET_BRANCH is "dev" (or the branch you want).
+# 4) Confirm SOURCE_FOLDER is "data-pipelines" and TARGET_FOLDER_PATH is "." for root level.
+name: Sync folder to target repo on tag
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_REPO: "Hafizadeel7266/Pinwheel_Repository"
+      TARGET_BRANCH: "dev"
+      SOURCE_FOLDER: "data-pipelines"
+      TARGET_FOLDER_PATH: "."    # root level in target repo
+    steps:
+      - name: Checkout source repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set tag and commit env vars
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "COMMIT=$GITHUB_SHA" >> $GITHUB_ENV
+
+      - name: Verify tag commit is reachable from origin/main
+        run: |
+          git fetch origin main
+          if git merge-base --is-ancestor "$COMMIT" origin/main; then
+            echo "Commit $COMMIT is on origin/main (proceeding)"
+          else
+            echo "Commit $COMMIT is NOT reachable from origin/main — stopping"
+            exit 1
+          fi
+
+      - name: Prepare files to sync
+        run: |
+          if [ ! -d "${{ env.SOURCE_FOLDER }}" ]; then
+            echo "Source folder '${{ env.SOURCE_FOLDER }}' does not exist. Exiting."
+            exit 1
+          fi
+          rm -rf /tmp/sync
+          mkdir -p /tmp/sync
+          rsync -a --delete "${{ env.SOURCE_FOLDER }}/" /tmp/sync/
+
+      - name: Clone target repository and replace folder
+        env:
+          PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "TARGET_REPO_PAT secret is not set. Exiting."
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${PAT}@github.com/${TARGET_REPO}.git" target-repo
+          cd target-repo
+
+          # ensure branch exists or create it
+          if git ls-remote --exit-code --heads origin "${TARGET_BRANCH}"; then
+            git checkout "${TARGET_BRANCH}"
+            git pull origin "${TARGET_BRANCH}"
+          else
+            git checkout -b "${TARGET_BRANCH}"
+          fi
+
+          # Replace target path
+          if [ "${TARGET_FOLDER_PATH}" = "." ] || [ "${TARGET_FOLDER_PATH}" = "/" ]; then
+            # Remove everything except .git
+            # Use bash to preserve dotfiles
+            bash -lc 'shopt -s dotglob; for f in * .[^.]*; do if [ "$f" != ".git" ]; then rm -rf "$f"; fi; done'
+            cp -r /tmp/sync/. .
+          else
+            rm -rf "${TARGET_FOLDER_PATH}"
+            mkdir -p "$(dirname "${TARGET_FOLDER_PATH}")"
+            mkdir -p "${TARGET_FOLDER_PATH}"
+            cp -r /tmp/sync/. "${TARGET_FOLDER_PATH}/"
+          fi
+
+          # commit only if there are changes
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit in target repo."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Sync ${SOURCE_FOLDER} from ${GITHUB_REPOSITORY} at tag ${TAG}"
+          git push "https://x-access-token:${PAT}@github.com/${TARGET_REPO}.git" "${TARGET_BRANCH}"

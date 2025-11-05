@@ -19,7 +19,7 @@ jobs:
       TARGET_REPO: "Hafizadeel7266/Pinwheel_Repository"
       TARGET_BRANCH: "dev"
       SOURCE_FOLDER: "Data-Pipeline"
-      TARGET_FOLDER_PATH: "Pipeline/"    # will be normalized to "Pipeline"
+      TARGET_FOLDER_PATH: "Data-Pipeline"    # copy into 'Data-Pipeline' folder in target repo
     steps:
       - name: Checkout source repo (full history)
         uses: actions/checkout@v4
@@ -84,13 +84,12 @@ jobs:
           RAW="${TARGET_FOLDER_PATH:-}"
           FINAL_TARGET_PATH="${RAW%/}"
 
-          # If user set "." or empty, map to SOURCE_FOLDER name (safer than root)
+          # If user set "." or empty, DO NOT allow root — require explicit non-empty folder
           if [ -z "${FINAL_TARGET_PATH}" ] || [ "${FINAL_TARGET_PATH}" = "." ]; then
-            FINAL_TARGET_PATH="${SOURCE_FOLDER}"
-            echo "TARGET_FOLDER_PATH was empty or '.' — mapping to '${FINAL_TARGET_PATH}'"
-          else
-            echo "Normalized target folder path: '${FINAL_TARGET_PATH}'"
+            echo "ERROR: TARGET_FOLDER_PATH must be a non-empty folder path (not '.' or empty). Aborting."
+            exit 1
           fi
+          echo "Normalized target folder path: '${FINAL_TARGET_PATH}'"
 
           # Safety checks
           if [[ "${FINAL_TARGET_PATH}" = /* ]] || [[ "${FINAL_TARGET_PATH}" = *".git"* ]] || [[ "${FINAL_TARGET_PATH}" = *".."* ]]; then
@@ -112,8 +111,17 @@ jobs:
           echo "Status of target folder after copy:"
           ls -la "${FINAL_TARGET_PATH}" || echo "target folder missing"
 
+          # Safety check: ensure no deletions occurred outside the target folder
+          echo "Checking for unintended deletions outside '${FINAL_TARGET_PATH}'"
+          if git status --porcelain | awk '$1 ~ /^D/ {print $2}' | grep -v "^${FINAL_TARGET_PATH}/" | grep -q .; then
+            echo "ERROR: Detected deletions outside '${FINAL_TARGET_PATH}'. Aborting to protect the target repo."
+            echo "Changes detected:"
+            git status --porcelain
+            exit 1
+          fi
+
           # Stage only the target folder (do NOT stage other files)
-          git add -- "${FINAL_TARGET_PATH}"
+          git add -A -- "${FINAL_TARGET_PATH}/"
 
           # If no staged changes, exit
           if git diff --cached --quiet; then
@@ -123,5 +131,5 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Add/Update ${SOURCE_FOLDER} from ${GITHUB_REPOSITORY} at tag ${TAG} -> ${FINAL_TARGET_PATH}"
+          git commit -m "Sync ${SOURCE_FOLDER} from ${GITHUB_REPOSITORY} at tag ${TAG} -> ${FINAL_TARGET_PATH} (merge-only, no deletions)"
           git push "https://x-access-token:${PAT}@github.com/${TARGET_REPO}.git" "${TARGET_BRANCH}"

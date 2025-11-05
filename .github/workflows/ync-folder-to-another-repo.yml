@@ -22,7 +22,7 @@ jobs:
     env:
       TARGET_REPO: "Hafizadeel7266/Pinwheel_Repository"
       TARGET_BRANCH: "dev"
-      SOURCE_FOLDER: "data-pipelines"
+      SOURCE_FOLDER: "Data-Pipeline"
       TARGET_FOLDER_PATH: "."    # root level in target repo
     steps:
       - name: Checkout source repo (full history)

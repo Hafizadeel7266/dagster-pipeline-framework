@@ -1,13 +1,10 @@
 # Sync a specific folder from this repo to another repo when a tag is created.
-# Safety: this workflow will ONLY remove and replace a single folder in the target repo.
-# It will never wipe the repo root. TARGET_FOLDER_PATH can include a trailing slash (e.g. "Pipeline/")
-# and will be normalized to remove the trailing slash before any remove operation.
+# Safety: this workflow will NOT remove other folders or wipe the target repo.
+# It copies (merges) SOURCE_FOLDER into FINAL_TARGET_PATH in the target repo.
 #
-# BEFORE USING:
-# - Add a secret TARGET_REPO_PAT (PAT with write access to the target repo) in the source repo.
-# - Update TARGET_REPO and TARGET_BRANCH if different.
-# - SOURCE_FOLDER is the folder in this repo to copy (e.g. "Data-Pipeline").
-# - TARGET_FOLDER_PATH is the folder in the target repo to replace (e.g. "Pipeline/" or "some/path/Folder").
+# To change behavior:
+# - To overwrite existing files inside the target folder: use rsync -a (default below).
+# - To only add new files and never overwrite existing files: use rsync -a --ignore-existing
 name: Sync folder to target repo on tag
 
 on:
@@ -22,7 +19,7 @@ jobs:
       TARGET_REPO: "Hafizadeel7266/Pinwheel_Repository"
       TARGET_BRANCH: "dev"
       SOURCE_FOLDER: "Data-Pipeline"
-      TARGET_FOLDER_PATH: "Pipeline/"    # user-specified; trailing slash will be handled
+      TARGET_FOLDER_PATH: "Pipeline/"    # will be normalized to "Pipeline"
     steps:
       - name: Checkout source repo (full history)
         uses: actions/checkout@v4
@@ -60,20 +57,18 @@ jobs:
           echo "Using source path: $SRC_PATH"
           rm -rf /tmp/sync
           mkdir -p /tmp/sync
-          rsync -a --delete "$SRC_PATH"/ /tmp/sync/
+          rsync -a "${SRC_PATH}/" /tmp/sync/
 
-      - name: Clone target repository and replace only the specified target folder (safe)
+      - name: Clone target repository and merge only the specified folder (safe)
         env:
           PAT: ${{ secrets.TARGET_REPO_PAT }}
         run: |
           set -euo pipefail
-
           if [ -z "${PAT:-}" ]; then
             echo "TARGET_REPO_PAT secret is not set. Exiting."
             exit 1
           fi
 
-          echo "Cloning target repo https://github.com/${TARGET_REPO}.git"
           git clone "https://x-access-token:${PAT}@github.com/${TARGET_REPO}.git" target-repo
           cd target-repo
 
@@ -89,7 +84,7 @@ jobs:
           RAW="${TARGET_FOLDER_PATH:-}"
           FINAL_TARGET_PATH="${RAW%/}"
 
-          # If user set "." or empty, map to SOURCE_FOLDER (safe mapping)
+          # If user set "." or empty, map to SOURCE_FOLDER name (safer than root)
           if [ -z "${FINAL_TARGET_PATH}" ] || [ "${FINAL_TARGET_PATH}" = "." ]; then
             FINAL_TARGET_PATH="${SOURCE_FOLDER}"
             echo "TARGET_FOLDER_PATH was empty or '.' — mapping to '${FINAL_TARGET_PATH}'"
@@ -97,46 +92,36 @@ jobs:
             echo "Normalized target folder path: '${FINAL_TARGET_PATH}'"
           fi
 
-          # Safety checks before removing anything:
-          # - must not be absolute path (no leading /)
-          # - must not reference .git
-          # - must not contain ".." segments
-          if [[ "${FINAL_TARGET_PATH}" = /* ]]; then
-            echo "ERROR: final target path is absolute. Aborting."
-            exit 1
-          fi
-          if [[ "${FINAL_TARGET_PATH}" = *".git"* ]] || [[ "${FINAL_TARGET_PATH}" = *"/.git"* ]]; then
-            echo "ERROR: final target path references .git. Aborting."
-            exit 1
-          fi
-          if [[ "${FINAL_TARGET_PATH}" = *".."* ]]; then
-            echo "ERROR: final target path contains '..'. Aborting."
+          # Safety checks
+          if [[ "${FINAL_TARGET_PATH}" = /* ]] || [[ "${FINAL_TARGET_PATH}" = *".git"* ]] || [[ "${FINAL_TARGET_PATH}" = *".."* ]]; then
+            echo "ERROR: invalid FINAL_TARGET_PATH '${FINAL_TARGET_PATH}'. Aborting."
             exit 1
           fi
 
-          # Confirm current working dir is repo root (for debug)
-          echo "Target repo root listing (before replace):"
-          ls -la
-
-          # Remove and replace only the exact target folder
-          echo "Removing and replacing target folder: '${FINAL_TARGET_PATH}'"
-          # Guard against empty expansion in rm -rf
-          rm -rf -- "${FINAL_TARGET_PATH:?}"
+          # Merge copy: do NOT remove other folders. Create target folder and copy content into it.
+          echo "Merging files into target folder: '${FINAL_TARGET_PATH}'"
           mkdir -p "$(dirname "${FINAL_TARGET_PATH}")" || true
           mkdir -p "${FINAL_TARGET_PATH}"
-          cp -r /tmp/sync/. "${FINAL_TARGET_PATH}/"
+          # Option A (default) - merge and overwrite files with same name:
+          rsync -a /tmp/sync/ "${FINAL_TARGET_PATH}/"
 
-          echo "Contents of replaced folder (after copy):"
+          # Option B (alternative) - only add new files, do NOT overwrite:
+          # rsync -a --ignore-existing /tmp/sync/ "${FINAL_TARGET_PATH}/"
+
+          # Show what changed (for debugging)
+          echo "Status of target folder after copy:"
           ls -la "${FINAL_TARGET_PATH}" || echo "target folder missing"
 
-          # commit only if there are changes
-          git add -A
+          # Stage only the target folder (do NOT stage other files)
+          git add -- "${FINAL_TARGET_PATH}"
+
+          # If no staged changes, exit
           if git diff --cached --quiet; then
-            echo "No changes to commit in target repo."
+            echo "No changes to commit in target repo (folder was already up-to-date)."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Sync ${SOURCE_FOLDER} from ${GITHUB_REPOSITORY} at tag ${TAG} -> ${FINAL_TARGET_PATH}"
+          git commit -m "Add/Update ${SOURCE_FOLDER} from ${GITHUB_REPOSITORY} at tag ${TAG} -> ${FINAL_TARGET_PATH}"
           git push "https://x-access-token:${PAT}@github.com/${TARGET_REPO}.git" "${TARGET_BRANCH}"

@@ -2,13 +2,16 @@
 # - Triggers on any tag push
 # - Verifies the tag's commit is reachable from origin/main
 # - Copies SOURCE_FOLDER -> TARGET_REPO:TARGET_BRANCH at TARGET_FOLDER_PATH
-# - If TARGET_FOLDER_PATH is ".", the folder contents are copied to the target repo root
+# - IMPORTANT: This workflow NEVER wipes the target repo. It only replaces the specified target folder.
 #
 # Before using:
-# 1) Add a repository secret named TARGET_REPO_PAT (PAT with repo scope).
-# 2) Update TARGET_REPO to "Hafizadeel7266/Pinwheel_Repository" (or your destination).
-# 3) Confirm TARGET_BRANCH is "dev" (or the branch you want).
-# 4) Confirm SOURCE_FOLDER is "data-pipelines" and TARGET_FOLDER_PATH is "." for root level.
+# 1) Add a repository secret named TARGET_REPO_PAT (PAT with repo write access to the target repo).
+# 2) Update TARGET_REPO to "owner/target-repo" (e.g., Hafizadeel7266/Pinwheel_Repository).
+# 3) Confirm TARGET_BRANCH (e.g., "dev").
+# 4) Set SOURCE_FOLDER to the folder in this repo (e.g., "Data-Pipeline").
+# 5) Set TARGET_FOLDER_PATH to the folder path in the target repo you want replaced.
+#    - If you want the folder placed at the root under the same folder name, set TARGET_FOLDER_PATH to "." (the workflow will map "." to the SOURCE_FOLDER name).
+#    - Example: SOURCE_FOLDER="Data-Pipeline", TARGET_FOLDER_PATH="." -> the content will be written to "Data-Pipeline/" in the target repo root.
 name: Sync folder to target repo on tag
 
 on:
@@ -23,7 +26,7 @@ jobs:
       TARGET_REPO: "Hafizadeel7266/Pinwheel_Repository"
       TARGET_BRANCH: "dev"
       SOURCE_FOLDER: "Data-Pipeline"
-      TARGET_FOLDER_PATH: "."    # root level in target repo
+      TARGET_FOLDER_PATH: "."    # use "." to mean "create/replace folder with same name as SOURCE_FOLDER at repo root"
     steps:
       - name: Checkout source repo (full history)
         uses: actions/checkout@v4
@@ -35,6 +38,8 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           echo "TAG=$TAG" >> $GITHUB_ENV
           echo "COMMIT=$GITHUB_SHA" >> $GITHUB_ENV
+          echo "SOURCE_FOLDER=${SOURCE_FOLDER}" >> $GITHUB_ENV
+          echo "TARGET_FOLDER_PATH=${TARGET_FOLDER_PATH}" >> $GITHUB_ENV
 
       - name: Verify tag commit is reachable from origin/main
         run: |
@@ -46,25 +51,35 @@ jobs:
             exit 1
           fi
 
-      - name: Prepare files to sync
+      - name: Prepare files to sync (verify SOURCE_FOLDER exists)
         run: |
-          if [ ! -d "${{ env.SOURCE_FOLDER }}" ]; then
-            echo "Source folder '${{ env.SOURCE_FOLDER }}' does not exist. Exiting."
+          echo "Looking for source folder: '${SOURCE_FOLDER}'"
+          if [ -d "${SOURCE_FOLDER}" ]; then
+            SRC_PATH="${SOURCE_FOLDER}"
+          elif [ -d "$(echo "${SOURCE_FOLDER}" | tr '[:upper:]' '[:lower:]')" ]; then
+            SRC_PATH="$(echo "${SOURCE_FOLDER}" | tr '[:upper:]' '[:lower:]')"
+          else
+            echo "Source folder '${SOURCE_FOLDER}' does not exist. Listing repository root for debugging:"
+            ls -la
             exit 1
           fi
+          echo "Using source path: $SRC_PATH"
           rm -rf /tmp/sync
           mkdir -p /tmp/sync
-          rsync -a --delete "${{ env.SOURCE_FOLDER }}/" /tmp/sync/
+          rsync -a --delete "$SRC_PATH"/ /tmp/sync/
 
-      - name: Clone target repository and replace folder
+      - name: Clone target repository and replace target folder only
         env:
           PAT: ${{ secrets.TARGET_REPO_PAT }}
         run: |
-          if [ -z "$PAT" ]; then
+          set -euo pipefail
+
+          if [ -z "${PAT:-}" ]; then
             echo "TARGET_REPO_PAT secret is not set. Exiting."
             exit 1
           fi
 
+          echo "Cloning target repo https://github.com/${TARGET_REPO}.git"
           git clone "https://x-access-token:${PAT}@github.com/${TARGET_REPO}.git" target-repo
           cd target-repo
 
@@ -76,18 +91,26 @@ jobs:
             git checkout -b "${TARGET_BRANCH}"
           fi
 
-          # Replace target path
+          # Determine the final target path to replace.
+          # If TARGET_FOLDER_PATH is "." or "/", map it to the SOURCE_FOLDER name (so we don't wipe the repo).
           if [ "${TARGET_FOLDER_PATH}" = "." ] || [ "${TARGET_FOLDER_PATH}" = "/" ]; then
-            # Remove everything except .git
-            # Use bash to preserve dotfiles
-            bash -lc 'shopt -s dotglob; for f in * .[^.]*; do if [ "$f" != ".git" ]; then rm -rf "$f"; fi; done'
-            cp -r /tmp/sync/. .
+            FINAL_TARGET_PATH="${SOURCE_FOLDER}"
+            echo "TARGET_FOLDER_PATH is root; mapping to folder '${FINAL_TARGET_PATH}' in target repo"
           else
-            rm -rf "${TARGET_FOLDER_PATH}"
-            mkdir -p "$(dirname "${TARGET_FOLDER_PATH}")"
-            mkdir -p "${TARGET_FOLDER_PATH}"
-            cp -r /tmp/sync/. "${TARGET_FOLDER_PATH}/"
+            FINAL_TARGET_PATH="${TARGET_FOLDER_PATH}"
+            echo "Using explicit TARGET_FOLDER_PATH: ${FINAL_TARGET_PATH}"
           fi
+
+          # Remove only the target folder and replace with new content.
+          echo "Replacing target folder: '${FINAL_TARGET_PATH}'"
+          rm -rf "${FINAL_TARGET_PATH}"
+          mkdir -p "$(dirname "${FINAL_TARGET_PATH}")" || true
+          mkdir -p "${FINAL_TARGET_PATH}"
+          cp -r /tmp/sync/. "${FINAL_TARGET_PATH}/"
+
+          # Show a quick status for debugging
+          echo "Status of target repo after copying:"
+          ls -la "${FINAL_TARGET_PATH}" || echo "target folder missing"
 
           # commit only if there are changes
           git add -A
@@ -98,5 +121,5 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Sync ${SOURCE_FOLDER} from ${GITHUB_REPOSITORY} at tag ${TAG}"
+          git commit -m "Sync ${SOURCE_FOLDER} from ${GITHUB_REPOSITORY} at tag ${TAG} -> ${FINAL_TARGET_PATH}"
           git push "https://x-access-token:${PAT}@github.com/${TARGET_REPO}.git" "${TARGET_BRANCH}"

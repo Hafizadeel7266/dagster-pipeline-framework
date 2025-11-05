@@ -1,17 +1,13 @@
 # Sync a specific folder from this repo to another repo when a tag is created.
-# - Triggers on any tag push
-# - Verifies the tag's commit is reachable from origin/main
-# - Copies SOURCE_FOLDER -> TARGET_REPO:TARGET_BRANCH at TARGET_FOLDER_PATH
-# - IMPORTANT: This workflow NEVER wipes the target repo. It only replaces the specified target folder.
+# Safety: this workflow will ONLY remove and replace a single folder in the target repo.
+# It will never wipe the repo root. TARGET_FOLDER_PATH can include a trailing slash (e.g. "Pipeline/")
+# and will be normalized to remove the trailing slash before any remove operation.
 #
-# Before using:
-# 1) Add a repository secret named TARGET_REPO_PAT (PAT with repo write access to the target repo).
-# 2) Update TARGET_REPO to "owner/target-repo" (e.g., Hafizadeel7266/Pinwheel_Repository).
-# 3) Confirm TARGET_BRANCH (e.g., "dev").
-# 4) Set SOURCE_FOLDER to the folder in this repo (e.g., "Data-Pipeline").
-# 5) Set TARGET_FOLDER_PATH to the folder path in the target repo you want replaced.
-#    - If you want the folder placed at the root under the same folder name, set TARGET_FOLDER_PATH to "." (the workflow will map "." to the SOURCE_FOLDER name).
-#    - Example: SOURCE_FOLDER="Data-Pipeline", TARGET_FOLDER_PATH="." -> the content will be written to "Data-Pipeline/" in the target repo root.
+# BEFORE USING:
+# - Add a secret TARGET_REPO_PAT (PAT with write access to the target repo) in the source repo.
+# - Update TARGET_REPO and TARGET_BRANCH if different.
+# - SOURCE_FOLDER is the folder in this repo to copy (e.g. "Data-Pipeline").
+# - TARGET_FOLDER_PATH is the folder in the target repo to replace (e.g. "Pipeline/" or "some/path/Folder").
 name: Sync folder to target repo on tag
 
 on:
@@ -26,7 +22,7 @@ jobs:
       TARGET_REPO: "Hafizadeel7266/Pinwheel_Repository"
       TARGET_BRANCH: "dev"
       SOURCE_FOLDER: "Data-Pipeline"
-      TARGET_FOLDER_PATH: "."    # use "." to mean "create/replace folder with same name as SOURCE_FOLDER at repo root"
+      TARGET_FOLDER_PATH: "Pipeline/"    # user-specified; trailing slash will be handled
     steps:
       - name: Checkout source repo (full history)
         uses: actions/checkout@v4
@@ -38,8 +34,6 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           echo "TAG=$TAG" >> $GITHUB_ENV
           echo "COMMIT=$GITHUB_SHA" >> $GITHUB_ENV
-          echo "SOURCE_FOLDER=${SOURCE_FOLDER}" >> $GITHUB_ENV
-          echo "TARGET_FOLDER_PATH=${TARGET_FOLDER_PATH}" >> $GITHUB_ENV
 
       - name: Verify tag commit is reachable from origin/main
         run: |
@@ -53,13 +47,13 @@ jobs:
 
       - name: Prepare files to sync (verify SOURCE_FOLDER exists)
         run: |
-          echo "Looking for source folder: '${SOURCE_FOLDER}'"
-          if [ -d "${SOURCE_FOLDER}" ]; then
-            SRC_PATH="${SOURCE_FOLDER}"
-          elif [ -d "$(echo "${SOURCE_FOLDER}" | tr '[:upper:]' '[:lower:]')" ]; then
-            SRC_PATH="$(echo "${SOURCE_FOLDER}" | tr '[:upper:]' '[:lower:]')"
+          echo "Looking for source folder: '${{ env.SOURCE_FOLDER }}'"
+          if [ -d "${{ env.SOURCE_FOLDER }}" ]; then
+            SRC_PATH="${{ env.SOURCE_FOLDER }}"
+          elif [ -d "$(echo "${{ env.SOURCE_FOLDER }}" | tr '[:upper:]' '[:lower:]')" ]; then
+            SRC_PATH="$(echo "${{ env.SOURCE_FOLDER }}" | tr '[:upper:]' '[:lower:]')"
           else
-            echo "Source folder '${SOURCE_FOLDER}' does not exist. Listing repository root for debugging:"
+            echo "Source folder '${{ env.SOURCE_FOLDER }}' does not exist. Listing repository root for debugging:"
             ls -la
             exit 1
           fi
@@ -68,7 +62,7 @@ jobs:
           mkdir -p /tmp/sync
           rsync -a --delete "$SRC_PATH"/ /tmp/sync/
 
-      - name: Clone target repository and replace target folder only
+      - name: Clone target repository and replace only the specified target folder (safe)
         env:
           PAT: ${{ secrets.TARGET_REPO_PAT }}
         run: |
@@ -91,25 +85,48 @@ jobs:
             git checkout -b "${TARGET_BRANCH}"
           fi
 
-          # Determine the final target path to replace.
-          # If TARGET_FOLDER_PATH is "." or "/", map it to the SOURCE_FOLDER name (so we don't wipe the repo).
-          if [ "${TARGET_FOLDER_PATH}" = "." ] || [ "${TARGET_FOLDER_PATH}" = "/" ]; then
+          # Normalize TARGET_FOLDER_PATH: remove trailing slash if present
+          RAW="${TARGET_FOLDER_PATH:-}"
+          FINAL_TARGET_PATH="${RAW%/}"
+
+          # If user set "." or empty, map to SOURCE_FOLDER (safe mapping)
+          if [ -z "${FINAL_TARGET_PATH}" ] || [ "${FINAL_TARGET_PATH}" = "." ]; then
             FINAL_TARGET_PATH="${SOURCE_FOLDER}"
-            echo "TARGET_FOLDER_PATH is root; mapping to folder '${FINAL_TARGET_PATH}' in target repo"
+            echo "TARGET_FOLDER_PATH was empty or '.' — mapping to '${FINAL_TARGET_PATH}'"
           else
-            FINAL_TARGET_PATH="${TARGET_FOLDER_PATH}"
-            echo "Using explicit TARGET_FOLDER_PATH: ${FINAL_TARGET_PATH}"
+            echo "Normalized target folder path: '${FINAL_TARGET_PATH}'"
           fi
 
-          # Remove only the target folder and replace with new content.
-          echo "Replacing target folder: '${FINAL_TARGET_PATH}'"
-          rm -rf "${FINAL_TARGET_PATH}"
+          # Safety checks before removing anything:
+          # - must not be absolute path (no leading /)
+          # - must not reference .git
+          # - must not contain ".." segments
+          if [[ "${FINAL_TARGET_PATH}" = /* ]]; then
+            echo "ERROR: final target path is absolute. Aborting."
+            exit 1
+          fi
+          if [[ "${FINAL_TARGET_PATH}" = *".git"* ]] || [[ "${FINAL_TARGET_PATH}" = *"/.git"* ]]; then
+            echo "ERROR: final target path references .git. Aborting."
+            exit 1
+          fi
+          if [[ "${FINAL_TARGET_PATH}" = *".."* ]]; then
+            echo "ERROR: final target path contains '..'. Aborting."
+            exit 1
+          fi
+
+          # Confirm current working dir is repo root (for debug)
+          echo "Target repo root listing (before replace):"
+          ls -la
+
+          # Remove and replace only the exact target folder
+          echo "Removing and replacing target folder: '${FINAL_TARGET_PATH}'"
+          # Guard against empty expansion in rm -rf
+          rm -rf -- "${FINAL_TARGET_PATH:?}"
           mkdir -p "$(dirname "${FINAL_TARGET_PATH}")" || true
           mkdir -p "${FINAL_TARGET_PATH}"
           cp -r /tmp/sync/. "${FINAL_TARGET_PATH}/"
 
-          # Show a quick status for debugging
-          echo "Status of target repo after copying:"
+          echo "Contents of replaced folder (after copy):"
           ls -la "${FINAL_TARGET_PATH}" || echo "target folder missing"
 
           # commit only if there are changes

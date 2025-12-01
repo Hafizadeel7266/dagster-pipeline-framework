@@ -1,143 +1,44 @@
-# Sync a specific folder from this repo to another repo when a tag is created.
-# Safety: this workflow will NOT remove other folders or wipe the target repo.
-# It copies (merges) SOURCE_FOLDER into FINAL_TARGET_PATH in the target repo.
-#
-# To change behavior:
-# - To overwrite existing files inside the target folder: use rsync -a (default below).
-# - To only add new files and never overwrite existing files: use rsync -a --ignore-existing
-name: Sync folder to target repo on tag
+name: Sync dagster-pipeline-framework to Pinwheel_Repository
 
+# Trigger workflow when main branch receives a push (merge from feature)
 on:
   push:
-    tags:
-      - '*'
+    branches:
+      - feature/dagster_code
 
 jobs:
-  sync:
+  sync-to-repoA:
     runs-on: ubuntu-latest
-    env:
-      TARGET_REPO: "Hafizadeel7266/Pinwheel_Repository"
-      TARGET_BRANCH: "dev"
-      SOURCE_FOLDER: "Data-Pipeline"
-      TARGET_FOLDER_PATH: "Data-Pipeline"    # copy into 'Data-Pipeline' folder in target repo
+
     steps:
-      - name: Checkout source repo (full history)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      # Step 1: Checkout RepoB (current repo)
+      - name: Checkout dagster-pipeline-framework
+        uses: actions/checkout@v3
 
-      - name: Set tag and commit env vars
+      # Step 2: Clone RepoA using PAT
+      - name: Clone Pinwheel_Repository
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "COMMIT=$GITHUB_SHA" >> $GITHUB_ENV
+          git clone https://x-access-token:${{ secrets.REPOA_TOKEN }}@github.com/${{ secrets.REPOA_NAME }} Pinwheel_Repository
 
-      - name: Verify tag commit is reachable from origin/main
+      # Step 3: Copy dagster-pipeline-framework content into Pinwheel_Repository/Dagster_code (generic, safe)
+      - name: Copy dagster-pipeline-framework code into Pinwheel_Repository/Dagster_code
         run: |
-          git fetch origin main
-          if git merge-base --is-ancestor "$COMMIT" origin/main; then
-            echo "Commit $COMMIT is on origin/main (proceeding)"
-          else
-            echo "Commit $COMMIT is NOT reachable from origin/main — stopping"
-            exit 1
-          fi
+          # Remove old content in Dagster_code
+          rm -rf Pinwheel_Repository/Dagster_code/*
+          # Copy all dagster-pipeline-framework folders and files except .git, .github, and Pinwheel_Repository itself
+          rsync -av --exclude='.git' --exclude='.github' --exclude='Pinwheel_Repository' ./ Pinwheel_Repository/Dagster_code/
 
-      - name: Prepare files to sync (verify SOURCE_FOLDER exists)
+      # Step 4: Commit & Push changes to RepoA (only if changes exist)
+      - name: Commit and push changes to Pinwheel_Repository (only if changes exist)
         run: |
-          echo "Looking for source folder: '${{ env.SOURCE_FOLDER }}'"
-          if [ -d "${{ env.SOURCE_FOLDER }}" ]; then
-            SRC_PATH="${{ env.SOURCE_FOLDER }}"
-          elif [ -d "$(echo "${{ env.SOURCE_FOLDER }}" | tr '[:upper:]' '[:lower:]')" ]; then
-            SRC_PATH="$(echo "${{ env.SOURCE_FOLDER }}" | tr '[:upper:]' '[:lower:]')"
+          cd Pinwheel_Repository
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .
+          # Only commit if there are changes
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "Auto-sync: dagster-pipeline-framework merged to main"
+            git push
           else
-            echo "Source folder '${{ env.SOURCE_FOLDER }}' does not exist. Listing repository root for debugging:"
-            ls -la
-            exit 1
+            echo "No changes to commit"
           fi
-          echo "Using source path: $SRC_PATH"
-          rm -rf /tmp/sync
-          mkdir -p /tmp/sync
-          rsync -a "${SRC_PATH}/" /tmp/sync/
-
-      - name: Clone target repository and merge only the specified folder (safe)
-        env:
-          PAT: ${{ secrets.TARGET_REPO_PAT }}
-        run: |
-          set -euo pipefail
-          if [ -z "${PAT:-}" ]; then
-            echo "TARGET_REPO_PAT secret is not set. Exiting."
-            exit 1
-          fi
-
-          git clone "https://x-access-token:${PAT}@github.com/${TARGET_REPO}.git" target-repo
-          cd target-repo
-
-          # ensure branch exists or create it
-          if git ls-remote --exit-code --heads origin "${TARGET_BRANCH}"; then
-            git checkout "${TARGET_BRANCH}"
-            git pull origin "${TARGET_BRANCH}"
-            # ensure clean working tree to avoid carrying stray deletions
-            git reset --hard "HEAD"
-            git clean -fdx
-          else
-            git checkout -b "${TARGET_BRANCH}"
-          fi
-
-          # Normalize TARGET_FOLDER_PATH: remove trailing slash if present
-          RAW="${TARGET_FOLDER_PATH:-}"
-          FINAL_TARGET_PATH="${RAW%/}"
-
-          # If user set "." or empty, DO NOT allow root — require explicit non-empty folder
-          if [ -z "${FINAL_TARGET_PATH}" ] || [ "${FINAL_TARGET_PATH}" = "." ]; then
-            echo "ERROR: TARGET_FOLDER_PATH must be a non-empty folder path (not '.' or empty). Aborting."
-            exit 1
-          fi
-          echo "Normalized target folder path: '${FINAL_TARGET_PATH}'"
-
-          # Safety checks
-          if [[ "${FINAL_TARGET_PATH}" = /* ]] || [[ "${FINAL_TARGET_PATH}" = *".git"* ]] || [[ "${FINAL_TARGET_PATH}" = *".."* ]]; then
-            echo "ERROR: invalid FINAL_TARGET_PATH '${FINAL_TARGET_PATH}'. Aborting."
-            exit 1
-          fi
-
-          # Merge copy: do NOT remove other folders. Create target folder and copy content into it.
-          echo "Merging files into target folder: '${FINAL_TARGET_PATH}'"
-          mkdir -p "$(dirname "${FINAL_TARGET_PATH}")" || true
-          mkdir -p "${FINAL_TARGET_PATH}"
-          # Option A (default) - merge and overwrite files with same name:
-          rsync -a /tmp/sync/ "${FINAL_TARGET_PATH}/"
-
-          # Option B (alternative) - only add new files, do NOT overwrite:
-          # rsync -a --ignore-existing /tmp/sync/ "${FINAL_TARGET_PATH}/"
-
-          # Show what changed (for debugging)
-          echo "Status of target folder after copy:"
-          ls -la "${FINAL_TARGET_PATH}" || echo "target folder missing"
-
-          # Clear any previous staged changes (belt-and-suspenders)
-          git restore --staged :/
-
-          # Stage only the target folder (do NOT stage other files)
-          git add -A -- "${FINAL_TARGET_PATH}/"
-
-          # Validate index contains ONLY changes under target folder and NO deletions
-          echo "Validating staged changes are limited to '${FINAL_TARGET_PATH}/' and contain no deletions"
-          if git diff --cached --name-status | awk -v p="${FINAL_TARGET_PATH}/" '{ if ($1=="D" || index($2,p)!=1) { print; bad=1 } } END { exit bad }'; then
-            echo "Validation passed: only '${FINAL_TARGET_PATH}/' staged and no deletions."
-          else
-            echo "ERROR: Staged changes include deletions or paths outside '${FINAL_TARGET_PATH}/'. Aborting."
-            echo "Staged diff:"
-            git diff --cached --name-status
-            exit 1
-          fi
-
-          # If no staged changes, exit
-          if git diff --cached --quiet; then
-            echo "No changes to commit in target repo (folder was already up-to-date)."
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Sync ${SOURCE_FOLDER} from ${GITHUB_REPOSITORY} at tag ${TAG} -> ${FINAL_TARGET_PATH} (merge-only, no deletions)"
-          git push "https://x-access-token:${PAT}@github.com/${TARGET_REPO}.git" "${TARGET_BRANCH}"
